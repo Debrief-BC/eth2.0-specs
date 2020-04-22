@@ -28,6 +28,7 @@ It consists of four main sections:
   - [Multiplexing](#multiplexing)
 - [Eth2 network interaction domains](#eth2-network-interaction-domains)
   - [Configuration](#configuration)
+  - [MetaData](#metadata)
   - [The gossip domain: gossipsub](#the-gossip-domain-gossipsub)
     - [Topics and messages](#topics-and-messages)
       - [Global topics](#global-topics)
@@ -49,6 +50,8 @@ It consists of four main sections:
       - [Goodbye](#goodbye)
       - [BeaconBlocksByRange](#beaconblocksbyrange)
       - [BeaconBlocksByRoot](#beaconblocksbyroot)
+      - [Ping](#ping)
+      - [GetMetaData](#getmetadata)
   - [The discovery domain: discv5](#the-discovery-domain-discv5)
     - [Integration into libp2p stacks](#integration-into-libp2p-stacks)
     - [ENR structure](#enr-structure)
@@ -102,6 +105,7 @@ It consists of four main sections:
   - [Discovery](#discovery)
     - [Why are we using discv5 and not libp2p Kademlia DHT?](#why-are-we-using-discv5-and-not-libp2p-kademlia-dht)
     - [What is the difference between an ENR and a multiaddr, and why are we using ENRs?](#what-is-the-difference-between-an-enr-and-a-multiaddr-and-why-are-we-using-enrs)
+    - [Why do we not form ENRs and find peers until genesis block/state is known?](#why-do-we-not-form-enrs-and-find-peers-until-genesis-blockstate-is-known)
   - [Compression/Encoding](#compressionencoding)
     - [Why are we using SSZ for encoding?](#why-are-we-using-ssz-for-encoding)
     - [Why are we compressing, and at which layers?](#why-are-we-compressing-and-at-which-layers)
@@ -157,8 +161,7 @@ The following SecIO parameters MUST be supported by all stacks:
 The [Libp2p-noise](https://github.com/libp2p/specs/tree/master/noise) secure
 channel handshake with `secp256k1` identities will be used for mainnet.
 
-As specified in the libp2p specification, clients MUST support the `XX` handshake pattern and
-can optionally implement the `IK` and `XXfallback` patterns for optimistic 0-RTT.
+As specified in the libp2p specification, clients MUST support the `XX` handshake pattern.
 
 ## Protocol Negotiation
 
@@ -196,6 +199,24 @@ This section outlines constants that are used in this spec.
 | `ATTESTATION_PROPAGATION_SLOT_RANGE` | `32` | The maximum number of slots during which an attestation can be propagated. |
 | `MAXIMUM_GOSSIP_CLOCK_DISPARITY` | `500ms` | The maximum milliseconds of clock disparity assumed between honest nodes. |
 
+## MetaData
+
+Clients MUST locally store the following `MetaData`:
+
+```
+(
+  seq_number: uint64
+  attnets: Bitvector[ATTESTATION_SUBNET_COUNT]
+)
+```
+
+Where
+
+- `seq_number` is a `uint64` starting at `0` used to version the node's metadata. If any other field in the local `MetaData` changes, the node MUST increment `seq_number` by 1.
+- `attnets` is a `Bitvector` representing the node's persistent attestation subnet subscriptions.
+
+*Note*: `MetaData.seq_number` is used for versioning of the node's metadata, is entirely independent of the ENR sequence number, and will in most cases be out of sync with the ENR sequence number.
+
 ## The gossip domain: gossipsub
 
 Clients MUST support the [gossipsub](https://github.com/libp2p/specs/tree/master/pubsub/gossipsub) libp2p protocol.
@@ -226,6 +247,8 @@ Topics are plain UTF-8 strings and are encoded on the wire as determined by prot
     - `genesis_validators_root` is the static `Root` found in `state.genesis_validators_root`
 - `Name` - see table below
 - `Encoding` - the encoding strategy describes a specific representation of bytes that will be transmitted over the wire. See the [Encodings](#Encoding-strategies) section for further details.
+
+*Note*: `ForkDigestValue` is composed of values that are not known until the genesis block/state are available. Due to this, clients SHOULD NOT subscribe to gossipsub topics until these genesis values are known.
 
 Each gossipsub [message](https://github.com/libp2p/go-libp2p-pubsub/blob/master/pb/rpc.proto#L17-L24) has a maximum size of `GOSSIP_MAX_SIZE`. Clients MUST reject (fail validation) messages that are over this size limit. Likewise, clients MUST NOT emit or propagate messages larger than this limit.
 
@@ -260,13 +283,14 @@ There are two primary global topics used to propagate beacon blocks and aggregat
 
 - `beacon_block` - This topic is used solely for propagating new signed beacon blocks to all nodes on the networks. Signed blocks are sent in their entirety. The following validations MUST pass before forwarding the `signed_beacon_block` on the network
     - The block is not from a future slot (with a `MAXIMUM_GOSSIP_CLOCK_DISPARITY` allowance) -- i.e. validate that `signed_beacon_block.message.slot <= current_slot` (a client MAY queue future blocks for processing at the appropriate slot).
-    - The block is from a slot greater than the latest finalized slot (with a `MAXIMUM_GOSSIP_CLOCK_DISPARITY` allowance) -- i.e. validate that `signed_beacon_block.message.slot > compute_start_slot_at_epoch(state.finalized_checkpoint.epoch)` (a client MAY choose to validate and store such blocks for additional purposes -- e.g. slashing detection, archive nodes, etc).
+    - The block is from a slot greater than the latest finalized slot -- i.e. validate that `signed_beacon_block.message.slot > compute_start_slot_at_epoch(state.finalized_checkpoint.epoch)` (a client MAY choose to validate and store such blocks for additional purposes -- e.g. slashing detection, archive nodes, etc).
     - The block is the first block with valid signature received for the proposer for the slot, `signed_beacon_block.message.slot`.
-    - The proposer signature, `signed_beacon_block.signature`, is valid.
+    - The proposer signature, `signed_beacon_block.signature`, is valid with respect to the `proposer_index` pubkey.
+    - The block is proposed by the expected `proposer_index` for the block's slot in the context of the current shuffling (defined by `parent_root`/`slot`). If the `proposer_index` cannot immediately be verified against the expected shuffling, the block MAY be queued for later processing while proposers for the block's branch are calculated.
 - `beacon_aggregate_and_proof` - This topic is used to propagate aggregated attestations (as `SignedAggregateAndProof`s) to subscribing nodes (typically validators) to be included in future blocks. The following validations MUST pass before forwarding the `signed_aggregate_and_proof` on the network. (We define the following for convenience -- `aggregate_and_proof = signed_aggregate_and_proof.message` and `aggregate = aggregate_and_proof.aggregate`)
     - `aggregate.data.slot` is within the last `ATTESTATION_PROPAGATION_SLOT_RANGE` slots (with a `MAXIMUM_GOSSIP_CLOCK_DISPARITY` allowance) -- i.e. `aggregate.data.slot + ATTESTATION_PROPAGATION_SLOT_RANGE >= current_slot >= aggregate.data.slot` (a client MAY queue future aggregates for processing at the appropriate slot).
-    - The aggregate attestation defined by `hash_tree_root(aggregate)` has _not_ already been seen (via aggregate gossip, within a block, or through the creation of an equivalent aggregate locally).
-    - The `aggregate` is the first valid aggregate received for the aggregator with index `aggregate_and_proof.aggregator_index` for the slot `aggregate.data.slot`.
+    - The aggregate attestation defined by `hash_tree_root(aggregate)` has _not_ already been seen (via aggregate gossip, within a verified block, or through the creation of an equivalent aggregate locally).
+    - The `aggregate` is the first valid aggregate received for the aggregator with index `aggregate_and_proof.aggregator_index` for the epoch `aggregate.data.target.epoch`.
     - The block being voted for (`aggregate.data.beacon_block_root`) passes validation.
     - `aggregate_and_proof.selection_proof` selects the validator as an aggregator for the slot -- i.e. `is_aggregator(state, aggregate.data.slot, aggregate.data.index, aggregate_and_proof.selection_proof)` returns `True`.
     - The aggregator's validator index is within the aggregate's committee -- i.e. `aggregate_and_proof.aggregator_index in get_attesting_indices(state, aggregate.data, aggregate.aggregation_bits)`.
@@ -295,7 +319,7 @@ Attestation subnets are used to propagate unaggregated attestations to subsectio
     - The attestation's committee index (`attestation.data.index`) is for the correct subnet.
     - `attestation.data.slot` is within the last `ATTESTATION_PROPAGATION_SLOT_RANGE` slots (within a `MAXIMUM_GOSSIP_CLOCK_DISPARITY` allowance) -- i.e. `attestation.data.slot + ATTESTATION_PROPAGATION_SLOT_RANGE >= current_slot >= attestation.data.slot` (a client MAY queue future attestations for processing at the appropriate slot).
     - The attestation is unaggregated -- that is, it has exactly one participating validator (`len([bit for bit in attestation.aggregation_bits if bit == 0b1]) == 1`).
-    - The attestation is the first valid attestation received for the participating validator for the slot, `attestation.data.slot`.
+    - There has been no other attestation seen on an attestation subnet that has an identical `attestation.data.target.epoch` and participating validator index.
     - The block being voted for (`attestation.data.beacon_block_root`) passes validation.
     - The signature of `attestation` is valid.
 
@@ -321,7 +345,9 @@ Topics are post-fixed with an encoding. Encodings define how the payload of a go
 
 #### Mainnet
 
-- `ssz_snappy` - All objects are SSZ-encoded and then compressed with [Snappy](https://github.com/google/snappy). Example: The beacon aggregate attestation topic string is `/eth2/beacon_aggregate_and_proof/ssz_snappy`, and the data field of a gossipsub message is an `AggregateAndProof` that has been SSZ-encoded and then compressed with Snappy.
+- `ssz_snappy` - All objects are SSZ-encoded and then compressed with [Snappy](https://github.com/google/snappy) block compression. Example: The beacon aggregate attestation topic string is `/eth2/beacon_aggregate_and_proof/ssz_snappy`, and the data field of a gossipsub message is an `AggregateAndProof` that has been SSZ-encoded and then compressed with Snappy.
+
+Snappy has two formats: "block" and "frames" (streaming). Gossip messages remain relatively small (100s of bytes to 100s of kilobytes) so [basic snappy block compression](https://github.com/google/snappy/blob/master/format_description.txt) is used to avoid the additional overhead associated with snappy frames.
 
 Implementations MUST use a single encoding. Changing an encoding will require coordination between participating implementations.
 
@@ -424,7 +450,7 @@ Here, `result` represents the 1-byte response code.
 The token of the negotiated protocol ID specifies the type of encoding to be used for the req/resp interaction. Two values are possible at this time:
 
 -  `ssz`: the contents are [SSZ-encoded](../../ssz/simple-serialize.md). This encoding type MUST be supported by all clients. For objects containing a single field, only the field is SSZ-encoded not a container with a single field. For example, the `BeaconBlocksByRoot` request is an SSZ-encoded list of `Root`'s.
--  `ssz_snappy`: The contents are SSZ-encoded and then compressed with [Snappy](https://github.com/google/snappy). MAY be supported in the interoperability testnet; MUST be supported in mainnet.
+-  `ssz_snappy`: The contents are SSZ-encoded and then compressed with [Snappy](https://github.com/google/snappy) frames compression. MAY be supported in the interoperability testnet; MUST be supported in mainnet.
 
 #### SSZ-encoding strategy (with or without Snappy)
 
@@ -437,7 +463,7 @@ Snappy has two formats: "block" and "frames" (streaming). To support large reque
 Since snappy frame contents [have a maximum size of `65536` bytes](https://github.com/google/snappy/blob/master/framing_format.txt#L104)
  and frame headers are just `identifier (1) + checksum (4)` bytes, the expected buffering of a single frame is acceptable.
 
-**Encoding-dependent header:** Req/Resp protocols using the `ssz` or `ssz_snappy` encoding strategies MUST encode the length of the raw SSZ bytes, encoded as an unsigned [protobuf varint](https://developers.google.com/protocol-buffers/docs/encoding#varints). 
+**Encoding-dependent header:** Req/Resp protocols using the `ssz` or `ssz_snappy` encoding strategies MUST encode the length of the raw SSZ bytes, encoded as an unsigned [protobuf varint](https://developers.google.com/protocol-buffers/docs/encoding#varints).
 
 *Writing*: By first computing and writing the SSZ byte length, the SSZ encoder can then directly write the chunk contents to the stream.
 If Snappy is applied, it can be passed through a buffered Snappy writer to compress frame by frame.
@@ -551,7 +577,7 @@ Response Content:
 )
 ```
 
-Requests count beacon blocks from the peer starting from `start_slot`, leading up to the current head block as selected by fork choice. `step` defines the slot increment between blocks. For example, requesting blocks starting at `start_slot` 2 with a step value of 2 would return the blocks at slots [2, 4, 6, …]. In cases where a slot is empty for a given slot number, no block is returned. For example, if slot 4 were empty in the previous example, the returned array would contain [2, 6, …]. A step value of 1 returns all blocks on the range `[start_slot, start_slot + count)`.
+Requests beacon blocks in the slot range `[start_slot, start_slot + count * step)`, leading up to the current head block as selected by fork choice. `step` defines the slot increment between blocks. For example, requesting blocks starting at `start_slot` 2 with a step value of 2 would return the blocks at slots [2, 4, 6, …]. In cases where a slot is empty for a given slot number, no block is returned. For example, if slot 4 were empty in the previous example, the returned array would contain [2, 6, …].
 
 `BeaconBlocksByRange` is primarily used to sync historical blocks.
 
@@ -601,6 +627,60 @@ Clients MUST support requesting blocks since the latest finalized epoch.
 
 Clients MUST respond with at least one block, if they have it. Clients MAY limit the number of blocks in the response.
 
+#### Ping
+
+**Protocol ID:** `/eth2/beacon_chain/req/ping/1/`
+
+Request Content:
+
+```
+(
+  uint64
+)
+```
+
+Response Content:
+
+```
+(
+  uint64
+)
+```
+
+Sent intermittently, the `Ping` protocol checks liveness of connected peers.
+Peers request and respond with their local metadata sequence number (`MetaData.seq_number`).
+
+If the peer does not respond to the `Ping` request, the client MAY disconnect from the peer.
+
+A client can then determine if their local record of a peer's MetaData is up to date
+and MAY request an updated version via the `MetaData` RPC method if not.
+
+The request MUST be encoded as an SSZ-field.
+
+The response MUST consist of a single `response_chunk`.
+
+#### GetMetaData
+
+**Protocol ID:** `/eth2/beacon_chain/req/metadata/1/`
+
+No Request Content.
+
+Response Content:
+
+```
+(
+  MetaData
+)
+```
+
+Requests the MetaData of a peer. The request opens and negotiates the stream without
+sending any request content. Once established the receiving peer responds with
+it's local most up-to-date MetaData.
+
+The response MUST be encoded as an SSZ-container.
+
+The response MUST consist of a single `response_chunk`.
+
 ## The discovery domain: discv5
 
 Discovery Version 5 ([discv5](https://github.com/ethereum/devp2p/blob/master/discv5/discv5.md)) is used for peer discovery, both in the interoperability testnet and mainnet.
@@ -622,6 +702,9 @@ This integration enables the libp2p stack to subsequently form connections and s
 The Ethereum Node Record (ENR) for an Ethereum 2.0 client MUST contain the following entries (exclusive of the sequence number and signature, which MUST be present in an ENR):
 
 -  The compressed secp256k1 publickey, 33 bytes (`secp256k1` field).
+
+The ENR MAY contain the following entries:
+
 -  An IPv4 address (`ip` field) and/or IPv6 address (`ip6` field).
 -  A TCP port (`tcp` field) representing the local libp2p listening port.
 -  A UDP port (`udp` field) representing the local discv5 listening port.
@@ -630,11 +713,15 @@ Specifications of these parameters can be found in the [ENR Specification](http:
 
 #### Attestation subnet bitfield
 
-The ENR MAY contain an entry (`attnets`) signifying the attestation subnet bitfield with the following form to more easily discover peers participating in particular attestation gossip subnets.
+The ENR `attnets` entry signifies the attestation subnet bitfield with the following form to more easily discover peers participating in particular attestation gossip subnets.
 
 | Key          | Value                                            |
 |:-------------|:-------------------------------------------------|
 | `attnets`    | SSZ `Bitvector[ATTESTATION_SUBNET_COUNT]`        |
+
+If a node's `MetaData.attnets` has any non-zero bit, the ENR MUST include the `attnets` entry with the same value as `MetaData.attnets`.
+
+If a node's `MetaData.attnets` is composed of all zeros, the ENR MAY optionally include the `attnets` entry or leave it out entirely.
 
 #### Interop
 
@@ -669,6 +756,8 @@ where the fields of `ENRForkID` are defined as
     * `genesis_validators_root` is the static `Root` found in `state.genesis_validators_root`
 * `next_fork_version` is the fork version corresponding to the next planned hard fork at a future epoch. If no future fork is planned, set `next_fork_version = current_fork_version` to signal this fact
 * `next_fork_epoch` is the epoch at which the next fork is planned and the `current_fork_version` will be updated. If no future fork is planned, set `next_fork_epoch = FAR_FUTURE_EPOCH` to signal this fact
+
+*Note*: `fork_digest` is composed of values that are not not known until the genesis block/state are available. Due to this, clients SHOULD NOT form ENRs and begin peer discovery until genesis values are known.
 
 Clients SHOULD connect to peers with `fork_digest`, `next_fork_version`, and `next_fork_epoch` that match local values.
 
@@ -1009,6 +1098,12 @@ discv5 uses ENRs and we will presumably need to:
 
 1. Add `multiaddr` to the dictionary, so that nodes can advertise their multiaddr under a reserved namespace in ENRs. – and/or –
 2. Define a bi-directional conversion function between multiaddrs and the corresponding denormalized fields in an ENR (ip, ip6, tcp, tcp6, etc.), for compatibility with nodes that do not support multiaddr natively (e.g. Eth 1.0 nodes).
+
+### Why do we not form ENRs and find peers until genesis block/state is known?
+
+Although client software might very well be running locally prior to the solidification of the eth2 genesis state and block, clients cannot form valid ENRs prior to this point. ENRs contain `fork_digest` which utilizes the `genesis_validators_root` for a cleaner separation between chains so prior to knowing genesis, we cannot use `fork_digest` to cleanly find peers on our intended chain. Once genesis data is known, we can then form ENRs and safely find peers.
+
+When using an eth1 deposit contract for deposits, `fork_digest` will be known at least `MIN_GENESIS_DELAY` (24 hours in mainnet configuration) before `genesis_time`, providing ample time to find peers and form initial connections and gossip subnets prior to genesis.
 
 ## Compression/Encoding
 

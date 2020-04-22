@@ -77,6 +77,10 @@ test: pyspec
 	. venv/bin/activate; cd $(PY_SPEC_DIR); \
 	python -m pytest -n 4 --cov=eth2spec.phase0.spec --cov=eth2spec.phase1.spec --cov-report="html:$(COV_HTML_OUT)" --cov-branch eth2spec
 
+find_test: pyspec
+	. venv/bin/activate; cd $(PY_SPEC_DIR); \
+	python -m pytest -k=$(K) --cov=eth2spec.phase0.spec --cov=eth2spec.phase1.spec --cov-report="html:$(COV_HTML_OUT)" --cov-branch eth2spec
+
 citest: pyspec
 	mkdir -p tests/core/pyspec/test-reports/eth2spec; . venv/bin/activate; cd $(PY_SPEC_DIR); \
 	python -m pytest -n 4 --junitxml=eth2spec/test_results.xml eth2spec
@@ -113,7 +117,7 @@ install_deposit_contract_compiler:
 
 compile_deposit_contract:
 	cd $(DEPOSIT_CONTRACT_COMPILER_DIR); . venv/bin/activate; \
-	python3.7 deposit_contract/compile.py contracts/validator_registration.vy
+	python3.7 deposit_contract/compile.py ../contracts/validator_registration.vy
 
 test_compile_deposit_contract:
 	cd $(DEPOSIT_CONTRACT_COMPILER_DIR); . venv/bin/activate; \
